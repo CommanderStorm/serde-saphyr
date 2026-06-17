@@ -572,10 +572,24 @@ mod tests {
     use super::*;
     use crate::Location;
     use crate::de_error::{Error, MessageFormatter, TransformReason};
+    use crate::input_source::{IncludeResolveError, ResolveProblem};
     use crate::location::Locations;
 
     fn loc() -> Location {
         Location::UNKNOWN
+    }
+
+    fn resolver_error(error: IncludeResolveError, stack: Vec<String>) -> Error {
+        Error::ResolverError {
+            target: "child.yaml".to_owned(),
+            error,
+            stack,
+            location: loc(),
+        }
+    }
+
+    fn file_problem(problem: ResolveProblem) -> IncludeResolveError {
+        IncludeResolveError::FileInclude(Box::new(problem))
     }
 
     // -----------------------------------------------------------------------
@@ -679,7 +693,7 @@ mod tests {
             expected: "string".to_owned(),
             location: loc(),
         },
-        &["invalid value", "null", "string"]
+        "invalid value: null, expected string"
     )]
     #[case::serde_unknown_variant(
         Error::SerdeUnknownVariant {
@@ -687,7 +701,7 @@ mod tests {
             expected: vec!["bar", "baz"],
             location: loc(),
         },
-        &["unknown variant", "foo"]
+        "unknown variant `foo`, expected one of bar, baz"
     )]
     #[case::serde_unknown_field(
         Error::SerdeUnknownField {
@@ -695,18 +709,15 @@ mod tests {
             expected: vec!["a", "b"],
             location: loc(),
         },
-        &["unknown field", "xyz"]
+        "unknown field `xyz`, expected one of a, b"
     )]
     #[case::io_error(
         Error::IOError { cause: std::io::Error::other("disk full") },
-        &["IO error", "disk full"]
+        "IO error: disk full"
     )]
-    fn default_contains_messages(#[case] err: Error, #[case] needles: &[&str]) {
+    fn default_formatted_messages(#[case] err: Error, #[case] expected: &str) {
         let formatter = DefaultMessageFormatter;
-        let msg = formatter.format_message(&err);
-        for needle in needles {
-            assert!(msg.contains(needle), "got: {msg}, missing: {needle}");
-        }
+        assert_eq!(formatter.format_message(&err), expected);
     }
 
     #[rstest::rstest]
@@ -785,8 +796,10 @@ mod tests {
             },
         };
         // _r != UNKNOWN, d != UNKNOWN, d != r → appends defined-at suffix
-        let msg = formatter.format_message(&err);
-        assert!(msg.starts_with("alias msg"), "got: {msg}");
+        assert_eq!(
+            formatter.format_message(&err),
+            "alias msg (defined at line 5, column 0)"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -869,14 +882,17 @@ mod tests {
     }
 
     #[rstest::rstest]
-    #[case::binary_not_utf8(Error::BinaryNotUtf8 { location: loc() }, &["!!binary"])]
+    #[case::binary_not_utf8(
+        Error::BinaryNotUtf8 { location: loc() },
+        "!!binary scalar is not valid UTF-8 so cannot be stored into string."
+    )]
     #[case::alias_replay_limit_exceeded(
         Error::AliasReplayLimitExceeded {
             total_replayed_events: 1000,
             max_total_replayed_events: 500,
             location: loc(),
         },
-        &["too large or too complex", "1000"]
+        "YAML document too large or too complex: total_replayed_events=1000 > 500"
     )]
     #[case::alias_expansion_limit_exceeded(
         Error::AliasExpansionLimitExceeded {
@@ -885,7 +901,7 @@ mod tests {
             max_expansions_per_anchor: 100,
             location: loc(),
         },
-        &["too large or too complex", "7"]
+        "YAML document too large or too complex: anchor id 7: 200 > 100"
     )]
     #[case::alias_replay_stack_depth_exceeded(
         Error::AliasReplayStackDepthExceeded {
@@ -893,22 +909,22 @@ mod tests {
             max_depth: 20,
             location: loc(),
         },
-        &["too large or too complex", "50"]
+        "YAML document too large or too complex: depth=50 > 20"
     )]
     #[case::duplicate_mapping_key_with_key(
         Error::DuplicateMappingKey { key: Some("mykey".to_owned()), location: loc() },
-        &["mykey", "duplicate"]
+        "duplicate mapping key: mykey not allowed here"
     )]
     #[case::duplicate_mapping_key_without_key(
         Error::DuplicateMappingKey { key: None, location: loc() },
-        &["duplicate"]
+        "duplicate mapping key not allowed here"
     )]
     #[case::budget(
         Error::Budget {
             breach: crate::budget::BudgetBreach::Events { events: 9999 },
             location: loc(),
         },
-        &["too large or too complex"]
+        "YAML document too large or too complex: limits breached: Events { events: 9999 }"
     )]
     #[case::falls_through_to_default_for_unhandled(
         Error::SerdeInvalidType {
@@ -916,14 +932,11 @@ mod tests {
             expected: "map".to_owned(),
             location: loc(),
         },
-        &["invalid type"]
+        "invalid type: seq, expected map"
     )]
-    fn user_contains_messages(#[case] err: Error, #[case] needles: &[&str]) {
+    fn user_formatted_messages(#[case] err: Error, #[case] expected: &str) {
         let formatter = UserMessageFormatter;
-        let msg = formatter.format_message(&err);
-        for needle in needles {
-            assert!(msg.contains(needle), "got: {msg}, missing: {needle}");
-        }
+        assert_eq!(formatter.format_message(&err), expected);
     }
 
     // -----------------------------------------------------------------------
@@ -950,5 +963,299 @@ mod tests {
         let formatter = DefaultMessageFormatter.with_localizer(&localizer);
         let err = Error::Eof { location: loc() };
         assert_eq!(formatter.format_message(&err), "unexpected end of input");
+    }
+
+    #[rstest::rstest]
+    #[case::io(
+        resolver_error(IncludeResolveError::Io(std::io::Error::other("disk gone")), vec![]),
+        "failed to resolve include \"child.yaml\"\ndisk gone"
+    )]
+    #[case::message(
+        resolver_error(IncludeResolveError::Message("custom resolver failure".to_owned()), vec![]),
+        "failed to resolve include \"child.yaml\"\ncustom resolver failure"
+    )]
+    #[case::size_limit_exceeded(
+        resolver_error(IncludeResolveError::SizeLimitExceeded(4096, 1024), vec![]),
+        "failed to resolve include \"child.yaml\"\ninclude size 4096 bytes exceeds remaining size limit 1024 bytes"
+    )]
+    #[case::resolve_failed(
+        resolver_error(
+            file_problem(ResolveProblem::ResolveFailed {
+                spec: "child.yaml".to_owned(),
+                base_dir: "/etc/app".to_owned(),
+                err: std::io::Error::other("nope"),
+            }),
+            vec![],
+        ),
+        "failed to resolve include \"child.yaml\"\nfailed to resolve include 'child.yaml' from '/etc/app': nope"
+    )]
+    #[case::target_not_regular_file(
+        resolver_error(file_problem(ResolveProblem::TargetNotRegularFile {
+            target: "/dev/null".to_owned(),
+        }), vec![]),
+        "failed to resolve include \"child.yaml\"\ninclude target '/dev/null' is not a regular file"
+    )]
+    #[case::target_is_root_file(
+        resolver_error(file_problem(ResolveProblem::TargetIsRootFile {
+            spec: "root.yaml".to_owned(),
+        }), vec![]),
+        "failed to resolve include \"child.yaml\"\ninclude target 'root.yaml' resolves to the configured root file itself"
+    )]
+    #[case::parent_id_not_absolute_canonical(
+        resolver_error(file_problem(ResolveProblem::ParentIdNotAbsoluteCanonical {
+            parent_id: "../rel".to_owned(),
+        }), vec![]),
+        "failed to resolve include \"child.yaml\"\nSafeFileResolver expected parent include id to be an absolute canonical path, got '../rel'"
+    )]
+    #[case::parent_resolve_failed(
+        resolver_error(file_problem(ResolveProblem::ParentResolveFailed {
+            parent_id: "/etc/app/main.yaml".to_owned(),
+            from_name: "main.yaml".to_owned(),
+            err: std::io::Error::other("gone"),
+        }), vec![]),
+        "failed to resolve include \"child.yaml\"\nfailed to resolve parent include source '/etc/app/main.yaml' (from 'main.yaml'): gone"
+    )]
+    #[case::parent_not_regular_file(
+        resolver_error(file_problem(ResolveProblem::ParentNotRegularFile {
+            parent: "/dev/null".to_owned(),
+        }), vec![]),
+        "failed to resolve include \"child.yaml\"\ninclude parent '/dev/null' is not a regular file"
+    )]
+    #[case::parent_has_no_directory(
+        resolver_error(file_problem(ResolveProblem::ParentHasNoDirectory {
+            parent: "/".to_owned(),
+        }), vec![]),
+        "failed to resolve include \"child.yaml\"\ninclude parent '/' does not have a parent directory"
+    )]
+    #[case::resolves_outside_root(
+        resolver_error(file_problem(ResolveProblem::ResolvesOutsideRoot {
+            spec: "../../secret.yaml".to_owned(),
+            root: "/etc/app".to_owned(),
+        }), vec![]),
+        "failed to resolve include \"child.yaml\"\ninclude '../../secret.yaml' resolves outside the configured root '/etc/app'"
+    )]
+    #[case::traverses_symlink(
+        resolver_error(file_problem(ResolveProblem::TraversesSymlink {
+            spec: "link.yaml".to_owned(),
+        }), vec![]),
+        "failed to resolve include \"child.yaml\"\ninclude 'link.yaml' traverses a symlink, which is disabled by policy"
+    )]
+    #[case::absolute_path_not_allowed(
+        resolver_error(file_problem(ResolveProblem::AbsolutePathNotAllowed {
+            spec: "/abs.yaml".to_owned(),
+        }), vec![]),
+        "failed to resolve include \"child.yaml\"\nabsolute include paths are not allowed: /abs.yaml"
+    )]
+    #[case::empty_path(
+        resolver_error(file_problem(ResolveProblem::EmptyPath), vec![]),
+        "failed to resolve include \"child.yaml\"\ninclude path must not be empty"
+    )]
+    #[case::invalid_extension(
+        resolver_error(file_problem(ResolveProblem::InvalidExtension {
+            spec: "child.txt".to_owned(),
+        }), vec![]),
+        "failed to resolve include \"child.yaml\"\ninclude target 'child.txt' does not have a valid YAML extension (.yml or .yaml)"
+    )]
+    #[case::hidden_file(
+        resolver_error(file_problem(ResolveProblem::HiddenFile {
+            spec: ".secret.yaml".to_owned(),
+        }), vec![]),
+        "failed to resolve include \"child.yaml\"\ninclude target '.secret.yaml' is a hidden file, which is not allowed"
+    )]
+    #[case::empty_fragment(
+        resolver_error(file_problem(ResolveProblem::EmptyFragment), vec![]),
+        "failed to resolve include \"child.yaml\"\ninclude fragment must not be empty"
+    )]
+    #[case::fragment_contains_hash(
+        resolver_error(file_problem(ResolveProblem::FragmentContainsHash {
+            spec: "child.yaml#a#b".to_owned(),
+        }), vec![]),
+        "failed to resolve include \"child.yaml\"\ninclude fragment must not contain '#': child.yaml#a#b"
+    )]
+    fn default_resolver_error_messages(#[case] err: Error, #[case] expected: &str) {
+        let formatter = DefaultMessageFormatter;
+        assert_eq!(formatter.format_message(&err), expected);
+    }
+
+    #[test]
+    fn default_resolver_error_includes_stack() {
+        let formatter = DefaultMessageFormatter;
+        let err = resolver_error(
+            IncludeResolveError::Message("boom".to_owned()),
+            vec!["a.yaml".to_owned(), "b.yaml".to_owned()],
+        );
+        assert_eq!(
+            formatter.format_message(&err),
+            "failed to resolve include \"child.yaml\"\n\
+             while processing include from a.yaml -> b.yaml\n\
+             boom"
+        );
+    }
+
+    #[test]
+    fn default_cyclic_include_with_stack() {
+        let formatter = DefaultMessageFormatter;
+        let err = Error::CyclicInclude {
+            id: "loop.yaml".to_owned(),
+            stack: vec!["main.yaml".to_owned(), "loop.yaml".to_owned()],
+            location: loc(),
+        };
+        assert_eq!(
+            formatter.format_message(&err),
+            "cyclic include detected: loop.yaml\n\
+             while processing include from main.yaml -> loop.yaml"
+        );
+    }
+
+    #[test]
+    fn default_cyclic_include_without_stack() {
+        let formatter = DefaultMessageFormatter;
+        let err = Error::CyclicInclude {
+            id: "loop.yaml".to_owned(),
+            stack: vec![],
+            location: loc(),
+        };
+        assert_eq!(
+            formatter.format_message(&err),
+            "cyclic include detected: loop.yaml"
+        );
+    }
+
+    #[test]
+    fn default_unsupported_include_form() {
+        let formatter = DefaultMessageFormatter;
+        let err = Error::UnsupportedIncludeForm { location: loc() };
+        assert_eq!(
+            formatter.format_message(&err),
+            "!include currently only supports the scalar form: !include <path>"
+        );
+    }
+
+    #[rstest::rstest]
+    #[case::cyclic_include(
+        Error::CyclicInclude {
+            id: "loop.yaml".to_owned(),
+            stack: vec!["main.yaml".to_owned(), "loop.yaml".to_owned()],
+            location: loc(),
+        },
+        "cyclic include detected"
+    )]
+    #[case::unsupported_include_form(
+        Error::UnsupportedIncludeForm { location: loc() },
+        "!include currently only supports the scalar form: !include <path>"
+    )]
+    #[case::resolver_error(
+        resolver_error(IncludeResolveError::Message("internal detail".to_owned()), vec![]),
+        "failed to resolve include"
+    )]
+    fn user_include_messages(#[case] err: Error, #[case] expected: &str) {
+        let formatter = UserMessageFormatter;
+        assert_eq!(formatter.format_message(&err), expected);
+    }
+
+    #[test]
+    fn user_indentation_error() {
+        let formatter = UserMessageFormatter;
+        let err = Error::IndentationError {
+            required: crate::indentation::RequireIndent::Divisible(4),
+            actual: 2,
+            location: loc(),
+        };
+        assert_eq!(
+            formatter.format_message(&err),
+            "incorrect indentation: expected divisible by 4, found 2 spaces"
+        );
+    }
+
+    fn alias_error_both_known() -> Error {
+        Error::AliasError {
+            msg: "alias msg".to_owned(),
+            locations: Locations {
+                reference_location: Location::new(1, 0),
+                defined_location: Location::new(5, 0),
+            },
+        }
+    }
+
+    #[test]
+    fn default_with_localizer_uses_localizer() {
+        use crate::localizer::DefaultEnglishLocalizer;
+        let localizer = DefaultEnglishLocalizer;
+        let formatter = DefaultMessageFormatter.with_localizer(&localizer);
+        let err = alias_error_both_known();
+        assert_eq!(
+            formatter.format_message(&err),
+            "alias msg (defined at line 5, column 0)"
+        );
+    }
+
+    #[test]
+    fn user_with_localizer_uses_localizer() {
+        use crate::localizer::DefaultEnglishLocalizer;
+        let localizer = DefaultEnglishLocalizer;
+        let formatter = UserMessageFormatter.with_localizer(&localizer);
+        let err = alias_error_both_known();
+        assert_eq!(
+            formatter.format_message(&err),
+            "alias msg (defined at line 5, column 0)"
+        );
+    }
+
+    #[cfg(any(feature = "garde", feature = "validator"))]
+    fn sample_validation_issues() -> (Vec<crate::de_error::ValidationIssue>, crate::path_map::PathMap)
+    {
+        use crate::de_error::ValidationIssue;
+        use crate::path_map::{PathKey, PathMap};
+
+        let mut locations = PathMap::new();
+        locations.insert(
+            PathKey::empty().join("port"),
+            Locations {
+                reference_location: Location::new(3, 5),
+                defined_location: Location::UNKNOWN,
+            },
+        );
+
+        let issues = vec![
+            ValidationIssue {
+                path: PathKey::empty().join("port"),
+                code: "range".to_owned(),
+                message: Some("must be <= 65535".to_owned()),
+                params: vec![],
+            },
+            ValidationIssue {
+                path: PathKey::empty().join("name"),
+                code: "length".to_owned(),
+                message: None,
+                params: vec![("min".to_owned(), "1".to_owned())],
+            },
+            ValidationIssue {
+                path: PathKey::empty(),
+                code: "custom".to_owned(),
+                message: None,
+                params: vec![],
+            },
+        ];
+
+        (issues, locations)
+    }
+
+    #[cfg(any(feature = "garde", feature = "validator"))]
+    #[rstest::rstest]
+    #[cfg_attr(feature = "garde", case::garde({
+        let (issues, locations) = sample_validation_issues();
+        Error::ValidationError { issues, locations }
+    }))]
+    #[cfg_attr(feature = "validator", case::validator({
+        let (issues, locations) = sample_validation_issues();
+        Error::ValidatorError { issues, locations }
+    }))]
+    fn default_renders_validation_error(#[case] err: Error) {
+        assert_eq!(
+            DefaultMessageFormatter.format_message(&err),
+            "validation error at port: must be <= 65535 at line 3, column 5\n\
+             validation error at name: length (min=1)\n\
+             validation error at <root>: custom"
+        );
     }
 }

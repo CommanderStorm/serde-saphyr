@@ -362,7 +362,11 @@ impl<'a, W: Write> YamlSerializer<'a, W> {
             if !self.doc_started {
                 self.doc_started = true;
                 if self.yaml_12 {
-                    self.out.write_str("%YAML 1.2\n")?;
+                    // A `%YAML` directive must be terminated by a document-start
+                    // marker (`---`); without it the directive runs into the
+                    // content and parsers reject it with "did not find expected
+                    // <document start>".
+                    self.out.write_str("%YAML 1.2\n---\n")?;
                     // Still at start of a line after the directive.
                     self.at_line_start = true;
                 }
